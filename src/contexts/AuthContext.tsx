@@ -2,6 +2,7 @@ import React, { createContext, useContext, useEffect, useState } from 'react';
 import { User, Session } from '@supabase/supabase-js';
 import { supabase, UserProfile } from '../lib/supabase';
 import { sessionManager } from '../utils/sessionManager';
+import { useLocation, useNavigate } from 'react-router-dom';
 
 interface AuthContextType {
   user: User | null;
@@ -12,6 +13,8 @@ interface AuthContextType {
   signInWithGoogle: () => Promise<void>;
   signOut: () => Promise<void>;
   restoreSession: () => Promise<void>;
+  isConnected: boolean;
+  connectionError: string | null;
 }
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
@@ -34,14 +37,86 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
   const [session, setSession] = useState<Session | null>(null);
   const [loading, setLoading] = useState(true);
   const [isInitialized, setIsInitialized] = useState(false);
+  const [isConnected, setIsConnected] = useState(false);
+  const [connectionError, setConnectionError] = useState<string | null>(null);
+  const [retryCount, setRetryCount] = useState(0);
+  const maxRetries = 3;
+
+  // Test database connectivity
+  const testConnection = async (): Promise<boolean> => {
+    try {
+      setConnectionError(null);
+      
+      // Simple connectivity test
+      const { error } = await supabase
+        .from('user_profiles')
+        .select('id')
+        .limit(1);
+      
+      if (error) {
+        console.warn('Database connection test failed:', error);
+        setConnectionError(error.message);
+        setIsConnected(false);
+        return false;
+      }
+      
+      setIsConnected(true);
+      setRetryCount(0);
+      return true;
+    } catch (error) {
+      console.error('Connection test error:', error);
+      setConnectionError(error instanceof Error ? error.message : 'Connection failed');
+      setIsConnected(false);
+      return false;
+    }
+  };
+
+  // Retry connection with exponential backoff
+  const retryConnection = async (): Promise<void> => {
+    if (retryCount >= maxRetries) {
+      console.log('Max retries reached, giving up');
+      return;
+    }
+    
+    const delay = Math.pow(2, retryCount) * 1000; // Exponential backoff
+    console.log(`Retrying connection in ${delay}ms (attempt ${retryCount + 1}/${maxRetries})`);
+    
+    setTimeout(async () => {
+      setRetryCount(prev => prev + 1);
+      await testConnection();
+    }, delay);
+  };
+
   useEffect(() => {
+    // Test initial connection
+    testConnection();
+    
     // Get initial session
     const getInitialSession = async () => {
       try {
         setLoading(true);
-        const { data: { session }, error } = await supabase.auth.getSession();
+        
+        // Wait for connection before proceeding
+        const isConnected = await testConnection();
+        if (!isConnected) {
+          console.warn('Database not connected, proceeding with limited functionality');
+        }
+        
+        let session = null;
+        let error = null;
+        
+        try {
+          const result = await supabase.auth.getSession();
+          session = result.data.session;
+          error = result.error;
+        } catch (authError) {
+          console.warn('Auth service not available:', authError);
+          error = authError;
+        }
+        
         if (error) {
           console.error('Error getting session:', error);
+          setConnectionError(error.message);
         } else {
           setSession(session);
           setUser(session?.user ?? null);
@@ -51,6 +126,7 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
         }
       } catch (error) {
         console.error('Error in getInitialSession:', error);
+        setConnectionError(error instanceof Error ? error.message : 'Initialization failed');
         // Continue without auth if Supabase is not configured
         setSession(null);
         setUser(null);
@@ -81,20 +157,23 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
               lastLogin: new Date().toISOString(),
               subscription: userProfile?.subscription_status || 'free'
             });
+            
+            // Handle post-login redirect
+            if (event === 'SIGNED_IN') {
+              console.log('User signed in, handling redirect...');
+              
+              // Small delay to ensure all state is set
+              setTimeout(() => {
+                const redirectPath = sessionManager.getRedirectPath();
+                console.log('Redirecting to:', redirectPath);
+                
+                // Use sessionManager's enhanced redirect
+                sessionManager.performRedirect(redirectPath);
+              }, 500);
+            }
           } else {
             setUserProfile(null);
             sessionManager.clearAll();
-          }
-          
-          // Handle successful login - restore user's last location
-          if (event === 'SIGNED_IN') {
-            const redirectPath = sessionManager.getRedirectPath();
-            if (redirectPath !== '/') {
-              // Small delay to ensure all auth state is properly set
-              setTimeout(() => {
-                window.location.href = redirectPath;
-              }, 100);
-            }
           }
           
           // Clear stored location on sign out
@@ -108,6 +187,7 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
       subscription = data.subscription;
     } catch (error) {
       console.error('Error setting up auth listener:', error);
+      setConnectionError(error instanceof Error ? error.message : 'Auth setup failed');
       setLoading(false);
     }
 
@@ -122,6 +202,12 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
     try {
       console.log('Fetching user profile for:', userId);
       
+      // Check connection before proceeding
+      if (!isConnected) {
+        console.warn('Database not connected, skipping profile fetch');
+        return;
+      }
+      
       // First ensure user has portfolio data
       try {
         const { error: rpcError } = await supabase.rpc('ensure_user_portfolio_data', {
@@ -129,9 +215,11 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
         });
         if (rpcError) {
           console.warn('Could not ensure portfolio data:', rpcError);
+          // Don't fail completely, continue with profile fetch
         }
       } catch (rpcError) {
         console.warn('RPC call failed:', rpcError);
+        // Continue without portfolio data setup
       }
       
       let data = null;
@@ -210,12 +298,167 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
   const signInWithGoogle = async () => {
     try {
       // Store current location before redirecting to auth
-      const currentPath = window.location.pathname + window.location.search;
+      const currentPath = window.location.pathname;
+      const currentSearch = window.location.search;
+      const currentHash = window.location.hash;
+      
       if (sessionManager.shouldStorePath(currentPath)) {
-        sessionManager.storeLocation(currentPath);
+        sessionManager.storeLocation(currentPath, currentSearch, currentHash);
+        
+        // Also store as pending redirect for extra safety
+        const fullPath = currentPath + currentSearch + currentHash;
+        sessionManager.storePendingRedirect(fullPath, {
+          timestamp: Date.now(),
+          source: 'google_oauth'
+        });
       }
       
-      const { error } = await supabase.auth.signInWithOAuth({
+      let error = null;
+      
+      try {
+        const result = await supabase.auth.signInWithOAuth({
+          provider: 'google',
+          options: {
+            redirectTo: `${window.location.origin}/auth/callback`,
+            queryParams: {
+              access_type: 'offline',
+              prompt: 'consent'
+            }
+          }
+        });
+        error = result.error;
+      } catch (authError) {
+        console.error('OAuth initiation failed:', authError);
+        error = authError;
+      }
+      
+      if (error) {
+        console.error('Error signing in with Google:', error);
+        setConnectionError(error.message);
+        
+        // Clear stored redirects on error
+        sessionManager.clearPendingRedirect();
+        
+        // Show user-friendly error message
+        if (error.message.includes('not configured') || error.message.includes('provider')) {
+          alert('Google sign-in is not configured yet. Please check the setup guide.');
+        } else {
+          alert(`Sign-in failed: ${error.message}. Please try again.`);
+        }
+        return;
+      }
+    } catch (error) {
+      console.error('Error in signInWithGoogle:', error);
+      setConnectionError(error instanceof Error ? error.message : 'Sign-in failed');
+      alert('Sign-in failed. Please try again later.');
+    }
+  };
+
+  // Enhanced location tracking with better URL handling
+  useEffect(() => {
+    if (user && isInitialized && typeof window !== 'undefined') {
+      const currentPath = window.location.pathname;
+      const currentSearch = window.location.search;
+      const currentHash = window.location.hash;
+      
+      if (sessionManager.shouldStorePath(currentPath)) {
+        sessionManager.storeLocation(currentPath, currentSearch, currentHash);
+      }
+    }
+  }, [user, isInitialized]);
+
+  // Connection health monitoring
+  useEffect(() => {
+    if (!isInitialized) return;
+    
+    const healthCheck = setInterval(async () => {
+      if (!isConnected && retryCount < maxRetries) {
+        console.log('Connection lost, attempting to reconnect...');
+        await retryConnection();
+      }
+    }, 30000); // Check every 30 seconds
+    
+    return () => clearInterval(healthCheck);
+  }, [isInitialized, isConnected, retryCount]);
+
+  const signOut = async () => {
+    try {
+      setLoading(true);
+      sessionManager.clearAll();
+      
+      let error = null;
+      try {
+        const result = await supabase.auth.signOut();
+        error = result.error;
+      } catch (signOutError) {
+        console.warn('Sign out service call failed:', signOutError);
+        // Continue with local cleanup even if service call fails
+      }
+      
+      if (error) {
+        console.error('Error signing out:', error);
+        // Don't throw error, just log it and continue with cleanup
+      }
+      
+      // Force clear local state
+      setSession(null);
+      setUser(null);
+      setUserProfile(null);
+      
+    } catch (error) {
+      console.error('Error in signOut:', error);
+      // Don't throw error, ensure cleanup happens
+    } finally {
+      setLoading(false);
+    }
+  };
+  
+  const restoreSession = async () => {
+    try {
+      console.log('Restoring session...');
+      setLoading(true);
+      
+      // Test connection first
+      const connected = await testConnection();
+      if (!connected) {
+        console.warn('Database not connected, skipping session restore');
+        setLoading(false);
+        return;
+      }
+      
+      let session = null;
+      let error = null;
+      
+      try {
+        const result = await supabase.auth.getSession();
+        session = result.data.session;
+        error = result.error;
+      } catch (sessionError) {
+        console.warn('Session restore failed:', sessionError);
+        error = sessionError;
+      }
+      
+      if (error) {
+        console.error('Error restoring session:', error);
+        setConnectionError(error.message);
+        return;
+      }
+      
+      if (session?.user) {
+        setSession(session);
+        setUser(session.user);
+        await fetchUserProfile(session.user.id);
+        console.log('Session restored successfully');
+      } else {
+        console.log('No valid session found');
+      }
+    } catch (error) {
+      console.error('Error in restoreSession:', error);
+      setConnectionError(error instanceof Error ? error.message : 'Session restore failed');
+    } finally {
+      setLoading(false);
+    }
+  };
         provider: 'google',
         options: {
           redirectTo: `${window.location.origin}/auth/callback`
@@ -305,7 +548,9 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
     isInitialized,
     signInWithGoogle,
     signOut,
-    restoreSession
+    restoreSession,
+    isConnected,
+    connectionError
   };
 
   return (

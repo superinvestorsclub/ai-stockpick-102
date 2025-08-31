@@ -15,40 +15,92 @@ import { mockStockData } from './data/mockData';
 function AuthCallback() {
   const navigate = useNavigate();
   const location = useLocation();
-  const { restoreSession } = useAuth();
+  const { restoreSession, isConnected, connectionError } = useAuth();
+  const [status, setStatus] = useState<'processing' | 'redirecting' | 'error'>('processing');
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
   useEffect(() => {
     const handleAuthCallback = async () => {
       try {
         console.log('Handling auth callback...');
+        setStatus('processing');
         
-        // Wait a moment for the auth state to settle
-        await new Promise(resolve => setTimeout(resolve, 1000));
+        // Wait for connection to be established
+        let connectionAttempts = 0;
+        const maxConnectionAttempts = 10;
+        
+        while (!isConnected && connectionAttempts < maxConnectionAttempts) {
+          console.log(`Waiting for database connection... (${connectionAttempts + 1}/${maxConnectionAttempts})`);
+          await new Promise(resolve => setTimeout(resolve, 500));
+          connectionAttempts++;
+        }
+        
+        if (!isConnected && connectionError) {
+          console.warn('Proceeding without database connection:', connectionError);
+        }
         
         // Restore session to ensure all auth state is properly set
-        await restoreSession();
+        try {
+          await restoreSession();
+        } catch (restoreError) {
+          console.warn('Session restore failed, continuing with redirect:', restoreError);
+        }
         
-        // Get the stored location or default to momentum page
-        const lastLocation = localStorage.getItem('lastUserLocation');
-        const redirectTo = lastLocation && lastLocation !== '/auth/callback' ? lastLocation : '/momentum';
+        setStatus('redirecting');
+        
+        // Enhanced redirect logic using sessionManager
+        const redirectTo = sessionManager.getRedirectPath();
         
         console.log('Redirecting to:', redirectTo);
-        navigate(redirectTo, { replace: true });
+        
+        // Use sessionManager's enhanced redirect
+        sessionManager.performRedirect(redirectTo);
 
       } catch (error) {
         console.error('Error handling auth callback:', error);
-        navigate('/', { replace: true });
+        setStatus('error');
+        setErrorMessage(error instanceof Error ? error.message : 'Authentication failed');
+        
+        // Fallback redirect after error
+        setTimeout(() => {
+          navigate('/', { replace: true });
+        }, 3000);
       }
     };
 
     handleAuthCallback();
-  }, [navigate, location, restoreSession]);
+  }, [navigate, location, restoreSession, isConnected, connectionError]);
 
   return (
     <div className="min-h-screen bg-gray-50 flex items-center justify-center">
       <div className="text-center">
-        <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-600 mx-auto mb-4"></div>
-        <p className="text-gray-600">Completing sign in...</p>
+        {status === 'processing' && (
+          <>
+            <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-600 mx-auto mb-4"></div>
+            <p className="text-gray-600">Completing sign in...</p>
+            {!isConnected && (
+              <p className="text-sm text-orange-600 mt-2">Establishing database connection...</p>
+            )}
+          </>
+        )}
+        
+        {status === 'redirecting' && (
+          <>
+            <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-green-600 mx-auto mb-4"></div>
+            <p className="text-gray-600">Redirecting to your page...</p>
+          </>
+        )}
+        
+        {status === 'error' && (
+          <>
+            <div className="w-12 h-12 bg-red-100 rounded-full flex items-center justify-center mx-auto mb-4">
+              <span className="text-red-600 text-xl">!</span>
+            </div>
+            <p className="text-red-600 mb-2">Authentication Error</p>
+            <p className="text-sm text-gray-600">{errorMessage}</p>
+            <p className="text-xs text-gray-500 mt-2">Redirecting to home page...</p>
+          </>
+        )}
       </div>
     </div>
   );

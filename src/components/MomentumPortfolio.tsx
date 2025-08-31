@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { TrendingUp, TrendingDown, DollarSign, BarChart3, Calendar, Target, Lock, Star, RefreshCw, AlertCircle } from 'lucide-react';
+import { TrendingUp, TrendingDown, DollarSign, BarChart3, Calendar, Target, Lock, Star, RefreshCw, AlertCircle, Wifi, WifiOff } from 'lucide-react';
 import { usePortfolioData } from '../hooks/usePortfolioData';
 import { useAuth } from '../contexts/AuthContext';
 import Header from './Header';
@@ -16,12 +16,15 @@ const MomentumPortfolio: React.FC = () => {
     selectedQuarter, 
     setSelectedQuarter, 
     refreshData,
-    isDataStale 
+    isDataStale,
+    connectionStatus,
+    retryConnection
   } = usePortfolioData();
-  const { user, loading: authLoading, isInitialized } = useAuth();
+  const { user, loading: authLoading, isInitialized, isConnected, connectionError } = useAuth();
   const [showAuthModal, setShowAuthModal] = useState(false);
   const [selectedTimeframe, setSelectedTimeframe] = useState<'1M' | '3M' | '6M' | '1Y'>('3M');
   const [isRefreshing, setIsRefreshing] = useState(false);
+  const [isRetrying, setIsRetrying] = useState(false);
 
   const timeframes = [
     { key: '1M' as const, label: '1 Month' },
@@ -62,6 +65,16 @@ const MomentumPortfolio: React.FC = () => {
     }
   };
 
+  const handleRetryConnection = async () => {
+    try {
+      setIsRetrying(true);
+      await retryConnection();
+    } catch (error) {
+      console.error('Error retrying connection:', error);
+    } finally {
+      setIsRetrying(false);
+    }
+  };
   // Enhanced loading state with better UX
   if (loading || authLoading || !isInitialized) {
     return (
@@ -198,15 +211,44 @@ const MomentumPortfolio: React.FC = () => {
               <div>
                 <h2 className="text-xl font-bold text-gray-800 mb-2">Portfolio History</h2>
                 <p className="text-gray-600">Select a quarter to view historical portfolio composition</p>
-                {isDataStale && (
-                  <div className="flex items-center space-x-2 mt-2 text-orange-600">
-                    <AlertCircle className="w-4 h-4" />
-                    <span className="text-sm">Data may be outdated</span>
+                
+                {/* Connection Status */}
+                <div className="flex items-center space-x-4 mt-2">
+                  <div className={`flex items-center space-x-2 ${isConnected ? 'text-green-600' : 'text-red-600'}`}>
+                    {isConnected ? <Wifi className="w-4 h-4" /> : <WifiOff className="w-4 h-4" />}
+                    <span className="text-sm">
+                      {isConnected ? 'Connected' : 'Disconnected'}
+                    </span>
                   </div>
-                )}
+                  
+                  {isDataStale && (
+                    <div className="flex items-center space-x-2 text-orange-600">
+                      <AlertCircle className="w-4 h-4" />
+                      <span className="text-sm">Data may be outdated</span>
+                    </div>
+                  )}
+                  
+                  {connectionError && (
+                    <div className="flex items-center space-x-2 text-red-600">
+                      <AlertCircle className="w-4 h-4" />
+                      <span className="text-sm">Connection issues</span>
+                    </div>
+                  )}
+                </div>
               </div>
               
               <div className="flex items-center space-x-4 flex-wrap gap-2">
+                {!isConnected && (
+                  <button
+                    onClick={handleRetryConnection}
+                    disabled={isRetrying}
+                    className="flex items-center space-x-2 px-3 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                  >
+                    <WifiOff className={`w-4 h-4 ${isRetrying ? 'animate-spin' : ''}`} />
+                    <span className="text-sm">{isRetrying ? 'Reconnecting...' : 'Retry Connection'}</span>
+                  </button>
+                )}
+                
                 <button
                   onClick={handleRefresh}
                   disabled={isRefreshing}
@@ -230,6 +272,29 @@ const MomentumPortfolio: React.FC = () => {
                 </select>
               </div>
             </div>
+            
+            {/* Error Banner */}
+            {error && (
+              <div className="mt-4 p-4 bg-red-50 border border-red-200 rounded-lg">
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center space-x-2">
+                    <AlertCircle className="w-4 h-4" />
+                    <span className="text-sm text-red-800 font-medium">Data Loading Issue</span>
+                  </div>
+                  <button
+                    onClick={handleRetryConnection}
+                    disabled={isRetrying}
+                    className="text-sm text-red-600 hover:text-red-800 underline disabled:opacity-50"
+                  >
+                    {isRetrying ? 'Retrying...' : 'Retry'}
+                  </button>
+                </div>
+                <p className="text-sm text-red-700 mt-1">{error}</p>
+                <p className="text-xs text-red-600 mt-1">
+                  Showing cached or demo data. Some features may be limited.
+                </p>
+              </div>
+            )}
           </div>
         )}
 
@@ -265,21 +330,27 @@ const MomentumPortfolio: React.FC = () => {
 
           {/* Real-time Data Status */}
           {user && (
-            <div className="px-6 py-3 bg-green-50 border-b border-green-200">
+            <div className={`px-6 py-3 border-b ${
+              isConnected ? 'bg-green-50 border-green-200' : 'bg-orange-50 border-orange-200'
+            }`}>
               <div className="flex items-center justify-between">
-                <div className="flex items-center space-x-2 text-green-700">
-                  <div className="w-2 h-2 bg-green-500 rounded-full animate-pulse"></div>
+                <div className={`flex items-center space-x-2 ${
+                  isConnected ? 'text-green-700' : 'text-orange-700'
+                }`}>
+                  <div className={`w-2 h-2 rounded-full ${
+                    isConnected ? 'bg-green-500 animate-pulse' : 'bg-orange-500'
+                  }`}></div>
                   <span className="text-sm font-medium">
-                    Real-time updates enabled
+                    {isConnected ? 'Real-time updates enabled' : 'Limited connectivity mode'}
                   </span>
                   {portfolioSummary.length > 0 && (
-                    <span className="text-xs text-green-600">
+                    <span className={`text-xs ${isConnected ? 'text-green-600' : 'text-orange-600'}`}>
                       • {portfolioSummary.length} quarters tracked
                     </span>
                   )}
                 </div>
-                <div className="text-xs text-green-600">
-                  Connected • Last sync: {new Date().toLocaleTimeString()}
+                <div className={`text-xs ${isConnected ? 'text-green-600' : 'text-orange-600'}`}>
+                  {isConnected ? 'Connected' : 'Offline'} • Last sync: {new Date().toLocaleTimeString()}
                 </div>
               </div>
             </div>

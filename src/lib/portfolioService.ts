@@ -39,15 +39,101 @@ class PortfolioService {
   private connectionRetries = 0;
   private maxRetries = 3;
   private retryDelay = 1000;
+  private isConnected = false;
+  private connectionPromise: Promise<boolean> | null = null;
 
   /**
+   * Test database connectivity with retry logic
+   */
+  private async testConnection(): Promise<boolean> {
+    if (this.connectionPromise) {
+      return this.connectionPromise;
+    }
+    
+    this.connectionPromise = this._testConnection();
+    const result = await this.connectionPromise;
+    this.connectionPromise = null;
+    return result;
+  }
+
+  private async _testConnection(): Promise<boolean> {
+    try {
+      console.log('Testing database connection...');
+      
+      const { error } = await supabase
+        .from('portfolio_constituents')
+        .select('id')
+        .limit(1);
+      
+      if (error) {
+        console.warn('Database connection test failed:', error);
+        this.isConnected = false;
+        return false;
+      }
+      
+      console.log('Database connection successful');
+      this.isConnected = true;
+      this.connectionRetries = 0;
+      return true;
+    } catch (error) {
+      console.error('Connection test error:', error);
+      this.isConnected = false;
+      return false;
+    }
+  }
+
+  /**
+   * Retry connection with exponential backoff
+   */
+  private async retryConnection(): Promise<boolean> {
+    if (this.connectionRetries >= this.maxRetries) {
+      console.log('Max connection retries reached');
+      return false;
+    }
+    
+    this.connectionRetries++;
+    const delay = Math.pow(2, this.connectionRetries - 1) * this.retryDelay;
+    
+    console.log(`Retrying database connection in ${delay}ms (attempt ${this.connectionRetries}/${this.maxRetries})`);
+    
+    await new Promise(resolve => setTimeout(resolve, delay));
+    return this.testConnection();
+  }
+  /**
    * Get cached data or fetch fresh data
+   * Enhanced with connection checking and fallback handling
    */
   private async getCachedOrFetch<T>(
     cacheKey: string,
     fetchFn: () => Promise<T>,
-    forceFresh = false
+    forceFresh = false,
+    fallbackData?: T
   ): Promise<T> {
+    // Check connection first
+    const connected = await this.testConnection();
+    if (!connected) {
+      console.warn('Database not connected for cache key:', cacheKey);
+      
+      // Try to get cached data even if connection failed
+      const cached = this.cache.get(cacheKey);
+      if (cached) {
+        console.log('Using stale cached data due to connection issues:', cacheKey);
+        return cached.data;
+      }
+      
+      // Return fallback data if available
+      if (fallbackData !== undefined) {
+        console.log('Using fallback data for:', cacheKey);
+        return fallbackData;
+      }
+      
+      // Attempt retry
+      const retryConnected = await this.retryConnection();
+      if (!retryConnected) {
+        throw new Error('Database connection failed and no fallback data available');
+      }
+    }
+    
     if (!forceFresh) {
       const cached = this.cache.get(cacheKey);
       if (cached && Date.now() - cached.timestamp < this.CACHE_DURATION) {
@@ -57,17 +143,47 @@ class PortfolioService {
     }
 
     console.log('Fetching fresh data for:', cacheKey);
-    const data = await fetchFn();
+    
+    let data: T;
+    try {
+      data = await fetchFn();
+    } catch (fetchError) {
+      console.error('Fetch function failed:', fetchError);
+      
+      // Try cached data as fallback
+      const cached = this.cache.get(cacheKey);
+      if (cached) {
+        console.log('Using cached data as fallback due to fetch error');
+        return cached.data;
+      }
+      
+      // Use fallback data if available
+      if (fallbackData !== undefined) {
+        console.log('Using fallback data due to fetch error');
+        return fallbackData;
+      }
+      
+      throw fetchError;
+    }
+    
     this.cache.set(cacheKey, { data, timestamp: Date.now() });
     return data;
   }
 
   /**
    * Ensure user has portfolio data (copy from default if needed)
+   * Enhanced with better error handling and fallback logic
    */
   async ensureUserPortfolioData(userId: string): Promise<void> {
     try {
       console.log('Ensuring user portfolio data for:', userId);
+      
+      // Check connection first
+      const connected = await this.testConnection();
+      if (!connected) {
+        console.warn('Database not connected, skipping portfolio data setup');
+        return;
+      }
       
       let error = null;
       try {
@@ -77,38 +193,102 @@ class PortfolioService {
         error = result.error;
       } catch (rpcError) {
         console.warn('RPC call failed:', rpcError);
-        return; // Don't throw, just return
+        
+        // Try alternative approach: check if user has any data
+        try {
+          const { data: existingData, error: checkError } = await supabase
+            .from('portfolio_constituents')
+            .select('id')
+            .eq('user_id', userId)
+            .limit(1);
+          
+          if (checkError) {
+            console.warn('Could not check existing user data:', checkError);
+            return;
+          }
+          
+          if (!existingData || existingData.length === 0) {
+            console.log('No existing user data found, user will see default data');
+          }
+        } catch (checkError) {
+          console.warn('Alternative data check failed:', checkError);
+        }
+        
+        return;
       }
 
       if (error) {
         console.error('Error ensuring user portfolio data:', error);
-        return; // Don't throw, just return
+        return;
       }
       console.log('Successfully ensured user portfolio data');
     } catch (error) {
       console.error('Error in ensureUserPortfolioData:', error);
-      // Don't throw, just log
     }
   }
 
   /**
    * Get all portfolio constituents for a specific quarter
+   * Enhanced with better error handling and fallback data
    */
   async getPortfolioByQuarter(quarter: string, userId?: string): Promise<PortfolioConstituent[]> {
     const cacheKey = `portfolio_${quarter}_${userId || 'public'}`;
     
+    // Fallback data for when database is unavailable
+    const fallbackData: PortfolioConstituent[] = [
+      {
+        id: 1,
+        quarter: quarter,
+        stock_name: 'Tata Consultancy Services Ltd.',
+        stock_code: 'TCS',
+        company_logo_url: 'https://logo.clearbit.com/tcs.com',
+        weight: 8.33,
+        quarterly_returns: 15.2,
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+        user_id: userId
+      },
+      {
+        id: 2,
+        quarter: quarter,
+        stock_name: 'Reliance Industries Ltd.',
+        stock_code: 'RELIANCE',
+        company_logo_url: 'https://logo.clearbit.com/ril.com',
+        weight: 8.33,
+        quarterly_returns: 12.8,
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+        user_id: userId
+      },
+      {
+        id: 3,
+        quarter: quarter,
+        stock_name: 'HDFC Bank Ltd.',
+        stock_code: 'HDFCBANK',
+        company_logo_url: 'https://logo.clearbit.com/hdfcbank.com',
+        weight: 8.33,
+        quarterly_returns: 18.5,
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+        user_id: userId
+      },
+      {
+        id: 4,
+        quarter: quarter,
+        stock_name: 'Infosys Ltd.',
+        stock_code: 'INFY',
+        company_logo_url: 'https://logo.clearbit.com/infosys.com',
+        weight: 8.33,
+        quarterly_returns: 14.7,
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+        user_id: userId
+      }
+    ];
+    
     return this.getCachedOrFetch(cacheKey, async () => {
       try {
         console.log('Fetching portfolio data for quarter:', quarter, 'user:', userId);
-        
-        // Try to get session, but don't fail if it's not available
-        let session = null;
-        try {
-          const { data } = await supabase.auth.getSession();
-          session = data.session;
-        } catch (sessionError) {
-          console.warn('Could not get session:', sessionError);
-        }
         
         let query = supabase
           .from('portfolio_constituents')
@@ -116,8 +296,8 @@ class PortfolioService {
           .eq('quarter', quarter)
           .order('weight', { ascending: false });
 
-        // Add user filter if authenticated
-        if (userId && session) {
+        // Add user filter if authenticated and connected
+        if (userId && this.isConnected) {
           // First ensure user has data
           try {
             await this.ensureUserPortfolioData(userId);
@@ -139,34 +319,37 @@ class PortfolioService {
           error = result.error;
         } catch (queryError) {
           console.warn('Database query failed, using mock data:', queryError);
-          // Return empty array if database is not available
-          return [];
+          throw queryError; // Let getCachedOrFetch handle fallback
         }
 
         if (error) {
           console.error('Error fetching portfolio by quarter:', error);
           
-          // Retry logic for connection issues
-          if (this.connectionRetries < this.maxRetries && (error.message.includes('connection') || error.message.includes('network'))) {
-            this.connectionRetries++;
-            console.log(`Retrying connection (${this.connectionRetries}/${this.maxRetries})...`);
-            await new Promise(resolve => setTimeout(resolve, this.retryDelay * this.connectionRetries));
-            return this.getPortfolioByQuarter(quarter, userId);
+          // Check if it's a connection issue
+          if (error.message.includes('connection') || error.message.includes('network') || error.message.includes('timeout')) {
+            const retrySuccess = await this.retryConnection();
+            if (retrySuccess) {
+              // Retry the query once
+              const retryResult = await query;
+              if (retryResult.error) {
+                throw retryResult.error;
+              }
+              data = retryResult.data;
+            } else {
+              throw error;
+            }
+          } else {
+            throw error;
           }
-          
-          // Return empty array instead of throwing
-          return [];
         }
 
-        this.connectionRetries = 0; // Reset on success
         console.log('Successfully fetched portfolio data:', data?.length || 0, 'items');
         return data || [];
       } catch (error) {
         console.error('Error in getPortfolioByQuarter:', error);
-        // Return empty array instead of throwing
-        return [];
+        throw error; // Let getCachedOrFetch handle fallback
       }
-    });
+    }, false, fallbackData);
   }
 
   /**
@@ -238,13 +421,28 @@ class PortfolioService {
 
   /**
    * Get all available quarters with summary data
+   * Enhanced with fallback data and better error handling
    */
   async getQuartersSummary(userId?: string): Promise<QuarterSummary[]> {
     const cacheKey = `quarters_${userId || 'public'}`;
     
+    // Fallback quarters data
+    const fallbackQuarters: QuarterSummary[] = [
+      { quarter: 'Q4 2024', total_stocks: 12, avg_returns: 15.2, total_weight: 100 },
+      { quarter: 'Q3 2024', total_stocks: 12, avg_returns: 12.8, total_weight: 100 },
+      { quarter: 'Q2 2024', total_stocks: 12, avg_returns: 18.5, total_weight: 100 },
+      { quarter: 'Q1 2024', total_stocks: 12, avg_returns: 14.1, total_weight: 100 }
+    ];
+    
     return this.getCachedOrFetch(cacheKey, async () => {
       try {
         console.log('Fetching quarters summary for user:', userId);
+        
+        // Check connection
+        const connected = await this.testConnection();
+        if (!connected) {
+          throw new Error('Database connection not available');
+        }
         
         let query = supabase
           .from('portfolio_constituents')
@@ -271,32 +469,17 @@ class PortfolioService {
           error = result.error;
         } catch (queryError) {
           console.warn('Database query failed:', queryError);
-          // Return mock quarters if database is not available
-          return [
-            { quarter: 'Q4 2024', total_stocks: 12, avg_returns: 15.2, total_weight: 100 },
-            { quarter: 'Q3 2024', total_stocks: 12, avg_returns: 12.8, total_weight: 100 },
-            { quarter: 'Q2 2024', total_stocks: 12, avg_returns: 18.5, total_weight: 100 }
-          ];
+          throw queryError;
         }
 
         if (error) {
           console.error('Error fetching quarters summary:', error);
-          // Return mock data instead of throwing
-          return [
-            { quarter: 'Q4 2024', total_stocks: 12, avg_returns: 15.2, total_weight: 100 },
-            { quarter: 'Q3 2024', total_stocks: 12, avg_returns: 12.8, total_weight: 100 },
-            { quarter: 'Q2 2024', total_stocks: 12, avg_returns: 18.5, total_weight: 100 }
-          ];
+          throw error;
         }
 
         if (!data || data.length === 0) {
           console.log('No portfolio data found');
-          // Return mock quarters if no data
-          return [
-            { quarter: 'Q4 2024', total_stocks: 12, avg_returns: 15.2, total_weight: 100 },
-            { quarter: 'Q3 2024', total_stocks: 12, avg_returns: 12.8, total_weight: 100 },
-            { quarter: 'Q2 2024', total_stocks: 12, avg_returns: 18.5, total_weight: 100 }
-          ];
+          return fallbackQuarters;
         }
 
         // Group by quarter and calculate summaries
@@ -331,14 +514,27 @@ class PortfolioService {
         return summaries;
       } catch (error) {
         console.error('Error in getQuartersSummary:', error);
-        // Return mock data instead of throwing
-        return [
-          { quarter: 'Q4 2024', total_stocks: 12, avg_returns: 15.2, total_weight: 100 },
-          { quarter: 'Q3 2024', total_stocks: 12, avg_returns: 12.8, total_weight: 100 },
-          { quarter: 'Q2 2024', total_stocks: 12, avg_returns: 18.5, total_weight: 100 }
-        ];
+        throw error;
       }
-    });
+    }, false, fallbackQuarters);
+  }
+
+  /**
+   * Get connection status
+   */
+  getConnectionStatus(): { isConnected: boolean; retryCount: number } {
+    return {
+      isConnected: this.isConnected,
+      retryCount: this.connectionRetries
+    };
+  }
+
+  /**
+   * Force connection test
+   */
+  async forceConnectionTest(): Promise<boolean> {
+    this.connectionPromise = null;
+    return this.testConnection();
   }
 
   /**

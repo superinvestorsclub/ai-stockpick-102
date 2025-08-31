@@ -1,4 +1,5 @@
 import { createClient } from '@supabase/supabase-js';
+import { connectionManager } from './connectionManager';
 
 const supabaseUrl = import.meta.env.VITE_SUPABASE_URL;
 const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY;
@@ -28,7 +29,35 @@ const createSupabaseClient = () => {
       })
     };
   }
-  return createClient(supabaseUrl, supabaseAnonKey);
+  
+  // Create client with enhanced configuration
+  const client = createClient(supabaseUrl, supabaseAnonKey, {
+    auth: {
+      autoRefreshToken: true,
+      persistSession: true,
+      detectSessionInUrl: true,
+      flowType: 'pkce'
+    },
+    realtime: {
+      params: {
+        eventsPerSecond: 10
+      }
+    },
+    global: {
+      headers: {
+        'X-Client-Info': 'passive-wealth-app'
+      }
+    }
+  });
+  
+  // Set up connection monitoring
+  connectionManager.onHealthChange((health) => {
+    if (!health.isConnected && health.error) {
+      console.warn('Database connection issue detected:', health.error);
+    }
+  });
+  
+  return client;
 };
 
 export const supabase = createSupabaseClient() as any;
